@@ -206,7 +206,11 @@ CONF
     fi
 
     # Install binary
-    cp "$0" "$BIN_TARGET" 2>/dev/null || cat > "$BIN_TARGET" < "$0"
+    if [ -f "$0" ] && [ "$(basename "$0")" != "bash" ] && [ "$(basename "$0")" != "sh" ]; then
+        cp "$0" "$BIN_TARGET"
+    else
+        curl -fsSL https://raw.githubusercontent.com/pdnczone/guardian/main/guardian.sh -o "$BIN_TARGET"
+    fi
     chmod +x "$BIN_TARGET"
 
     # Install systemd unit & timer
