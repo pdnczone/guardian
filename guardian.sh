@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Guardian - Traffic & Connection Flood Circuit Breaker for Linux Proxy Nodes
+# Guardian v1.0.2 - Traffic & Connection Flood Circuit Breaker
 # Developed for PDNC ZONE (DNC DIRECT) - github.com/pdnczone/guardian
 # ==============================================================================
 
 set -e
 
+VERSION="1.0.2"
 CONF_DIR="/etc/guardian"
 CONF_FILE="${CONF_DIR}/guardian.conf"
 LOG_FILE="/var/log/guardian.log"
@@ -19,6 +20,7 @@ DEFAULT_MAX_STREAK=3
 DEFAULT_PORTS="1020,1030,1040,1050,7443,9443"
 DEFAULT_CONN_LIMIT=35
 DEFAULT_SERVICES="frps frpc"
+DEFAULT_WHITELIST=""
 
 load_config() {
     if [ -f "$CONF_FILE" ]; then
@@ -31,6 +33,7 @@ load_config() {
     PROTECTED_PORTS="${PROTECTED_PORTS:-$DEFAULT_PORTS}"
     CONN_LIMIT_PER_IP="${CONN_LIMIT_PER_IP:-$DEFAULT_CONN_LIMIT}"
     RESTART_SERVICES="${RESTART_SERVICES:-$DEFAULT_SERVICES}"
+    WHITELIST_IPS="${WHITELIST_IPS:-$DEFAULT_WHITELIST}"
     
     if [ -z "$IFACE" ] || [ "$IFACE" = "auto" ]; then
         IFACE=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
@@ -44,15 +47,18 @@ log() {
 
 apply_firewall() {
     load_config
-    echo "🛡️  Applying Guardian firewall rules..."
+    echo "🛡️  Applying Guardian firewall rules on interface ${IFACE}..."
     
-    # 0. Always allow loopback unconditionally at top
+    # 0. Always allow loopback & established traffic unconditionally at the very top
     iptables -D INPUT -i lo -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    
     iptables -I INPUT 1 -i lo -j ACCEPT
     iptables -I INPUT 2 -s 127.0.0.1 -j ACCEPT
+    iptables -I INPUT 3 -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-    # Clean previous Guardian rules to prevent duplicates
+    # 1. Clean previous Guardian rules to prevent duplicates
     iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
@@ -60,15 +66,33 @@ apply_firewall() {
     iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p udp --dport 1040 -j DROP 2>/dev/null || true
 
-    # 1. Block external direct internet access to tunnel-internal ports on primary interface
-    iptables -I INPUT 3 -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP
-    iptables -I INPUT 4 -i "$IFACE" -p udp --dport 1040 -j DROP
+    # 2. Whitelist custom management or peer IPs if defined
+    if [ -n "$WHITELIST_IPS" ]; then
+        IFS=',' read -ra WIPS <<< "$WHITELIST_IPS"
+        for wip in "${WIPS[@]}"; do
+            wip=$(echo "$wip" | xargs)
+            if [ -n "$wip" ]; then
+                iptables -D INPUT -s "$wip" -j ACCEPT 2>/dev/null || true
+                iptables -I INPUT 4 -s "$wip" -j ACCEPT
+            fi
+        done
+    fi
 
-    # 2. Per-IP Connection Limit on external interfaces ONLY (never loopback)
+    # 3. Block external direct internet access to tunnel-internal ports on primary public interface
+    iptables -I INPUT 5 -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP
+    iptables -I INPUT 6 -i "$IFACE" -p udp --dport 1040 -j DROP
+
+    # 4. Per-IP Connection Limit on external interfaces ONLY (never loopback or tunnels)
     iptables -A INPUT -i "$IFACE" -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset
     iptables -A INPUT -i "$IFACE" -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP
 
-    # 3. Save rules persistently
+    # 5. IPv6 basic loopback allowance if ip6tables is available
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D INPUT -i lo -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT 1 -i lo -j ACCEPT
+    fi
+
+    # 6. Save rules persistently
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
 
@@ -88,7 +112,7 @@ UNIT
 
     systemctl daemon-reload
     systemctl enable iptables-restore.service >/dev/null 2>&1 || true
-    echo "✅ Firewall rules applied and saved (Max ${CONN_LIMIT_PER_IP} conns/IP on ports ${PROTECTED_PORTS})."
+    echo "✅ Firewall rules applied and saved (Max ${CONN_LIMIT_PER_IP} conns/IP on ${IFACE} ports ${PROTECTED_PORTS})."
 }
 
 run_check() {
@@ -105,7 +129,7 @@ run_check() {
         # Trigger cooldown
         for srv in $RESTART_SERVICES; do
             if systemctl is-active --quiet "$srv" 2>/dev/null; then
-                log "Action: Restarting $srv to shed flood..."
+                log "Action: Restarting $srv to shed connection flood..."
                 systemctl restart "$srv"
             fi
         done
@@ -161,10 +185,16 @@ run_check() {
 show_status() {
     load_config
     echo "=================================================="
-    echo "🛡️  Guardian Status (PDNC ZONE)"
+    echo "🛡️  Guardian Status v${VERSION} (PDNC ZONE)"
     echo "=================================================="
     echo "Primary Interface : $IFACE"
-    echo "Active Conns      : $(ss -tn state established 2>/dev/null | wc -l) / Max Limit: $MAX_CONNS"
+    
+    tot_conns=$(ss -tn state established 2>/dev/null | wc -l)
+    loc_conns=$(ss -tn dst 127.0.0.1 2>/dev/null | wc -l)
+    ext_conns=$((tot_conns - loc_conns))
+    [ "$ext_conns" -lt 0 ] && ext_conns=0
+    
+    echo "Active Conns      : ${tot_conns} (Local Tunnel: ${loc_conns}, External: ${ext_conns}) / Max: ${MAX_CONNS}"
     
     stat_path="/sys/class/net/${IFACE}/statistics"
     if [ -d "$stat_path" ]; then
@@ -180,7 +210,7 @@ show_status() {
     echo "Timer Service     : $(systemctl is-active guardian.timer 2>/dev/null || echo 'inactive')"
     echo ""
     echo "--- Protected Ports (Firewall) ---"
-    iptables -L INPUT -n -v | grep -E "connlimit|multiport" | head -n 10
+    iptables -L INPUT -n -v | grep -E "connlimit|multiport|lo|127.0.0.1" | head -n 12
     echo ""
     echo "--- Last 5 Guardian Events ---"
     if [ -f "$LOG_FILE" ]; then
@@ -192,7 +222,7 @@ show_status() {
 }
 
 install_guardian() {
-    echo "🚀 Installing Guardian..."
+    echo "🚀 Installing Guardian v${VERSION}..."
     mkdir -p "$CONF_DIR"
     
     # Detect best default interface
@@ -201,14 +231,33 @@ install_guardian() {
 
     if [ ! -f "$CONF_FILE" ]; then
         cat << CONF > "$CONF_FILE"
-# Guardian Configuration File
+# ==============================================================================
+# Guardian Configuration File (/etc/guardian/guardian.conf)
+# ==============================================================================
+
+# Network interface to monitor and protect (auto or specific interface like eth0)
 IFACE="${def_iface}"
+
+# Maximum concurrent connections before triggering circuit-breaker cooldown
 MAX_CONNS=${DEFAULT_MAX_CONNS}
+
+# Maximum bandwidth threshold in Mbps
 MAX_MBPS=${DEFAULT_MAX_MBPS}
+
+# Consecutive checks above MAX_MBPS needed to trigger cooldown (checks are every 60s)
 MAX_STREAK=${DEFAULT_MAX_STREAK}
+
+# Protected inbound proxy/tunnel ports on external interface
 PROTECTED_PORTS="${DEFAULT_PORTS}"
+
+# Maximum simultaneous connections allowed per client IP on external interface
 CONN_LIMIT_PER_IP=${DEFAULT_CONN_LIMIT}
+
+# Services to restart during emergency cooldown
 RESTART_SERVICES="${DEFAULT_SERVICES}"
+
+# Whitelisted IPs exempt from limits (comma-separated, e.g. "1.2.3.4, 5.6.7.8")
+WHITELIST_IPS=""
 CONF
         echo "Created config at $CONF_FILE"
     fi
@@ -250,9 +299,9 @@ TIMER
     
     apply_firewall
     echo ""
-    echo "🎉 Guardian installed successfully!"
+    echo "🎉 Guardian v${VERSION} installed successfully!"
     echo "Commands:"
-    echo "  guardian status    - View live status & counters"
+    echo "  guardian status    - View live status, split connections & counters"
     echo "  guardian firewall  - Re-apply firewall protection"
     echo "  guardian run       - Run manual check"
     echo "  guardian uninstall - Remove Guardian"
@@ -265,8 +314,8 @@ uninstall_guardian() {
     systemctl daemon-reload
     
     load_config
-    iptables -D INPUT -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
-    iptables -D INPUT -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || true
+    iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    iptables -D INPUT -i "$IFACE" -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p udp --dport 1040 -j DROP 2>/dev/null || true
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
