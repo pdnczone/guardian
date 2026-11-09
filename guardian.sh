@@ -46,19 +46,27 @@ apply_firewall() {
     load_config
     echo "🛡️  Applying Guardian firewall rules..."
     
+    # 0. Always allow loopback unconditionally at top
+    iptables -D INPUT -i lo -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT 1 -i lo -j ACCEPT
+    iptables -I INPUT 2 -s 127.0.0.1 -j ACCEPT
+
     # Clean previous Guardian rules to prevent duplicates
+    iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    iptables -D INPUT -i "$IFACE" -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || true
     iptables -D INPUT -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     iptables -D INPUT -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP 2>/dev/null || true
     iptables -D INPUT -i "$IFACE" -p udp --dport 1040 -j DROP 2>/dev/null || true
 
     # 1. Block external direct internet access to tunnel-internal ports on primary interface
-    iptables -I INPUT 1 -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP
-    iptables -I INPUT 2 -i "$IFACE" -p udp --dport 1040 -j DROP
+    iptables -I INPUT 3 -i "$IFACE" -p tcp -m multiport --dports 1020,1030,1050 -j DROP
+    iptables -I INPUT 4 -i "$IFACE" -p udp --dport 1040 -j DROP
 
-    # 2. Per-IP Connection Limit on protected proxy & reality ports
-    iptables -I INPUT 3 -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset
-    iptables -I INPUT 4 -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP
+    # 2. Per-IP Connection Limit on external interfaces ONLY (never loopback)
+    iptables -A INPUT -i "$IFACE" -p tcp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j REJECT --reject-with tcp-reset
+    iptables -A INPUT -i "$IFACE" -p udp -m multiport --dports "$PROTECTED_PORTS" -m connlimit --connlimit-above "$CONN_LIMIT_PER_IP" --connlimit-mask 32 -j DROP
 
     # 3. Save rules persistently
     mkdir -p /etc/iptables
